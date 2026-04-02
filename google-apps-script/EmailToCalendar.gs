@@ -19,22 +19,16 @@ const CONFIG = {
   // Label to mark processed emails
   GMAIL_LABEL: "CalendarProcessed",
 
+  // Google My Map ID — used to fetch locations via KML export
+  // From: https://www.google.com/maps/d/viewer?mid=1MAmmlfBC9qNeqYU-UkCRMMcBhMM
+  MY_MAP_ID: "1MAmmlfBC9qNeqYU-UkCRMMcBhMM",
+
+  // Static Maps image dimensions
+  STATIC_MAP_WIDTH: 600,
+  STATIC_MAP_HEIGHT: 400,
+
   // How many days ahead "next week" means (auto-calculated, but can override)
-  // Set to 0 for auto-detect (next Monday from today)
   FORCE_START_DATE: null,  // e.g. "2026-04-06" to force a specific Monday
-};
-
-// =============================================================================
-// Location database - Map location names to coordinates
-// Add your locations here: "Name": { lat: XX.XXXX, lng: YY.YYYY }
-// =============================================================================
-
-const LOCATIONS = {
-  "Steenen":       { lat: 57.7089, lng: 11.9746, description: "Steenen klätterområde" },
-  "Monsterstenen": { lat: 57.7150, lng: 11.9800, description: "Monsterstenen" },
-  "Mossberget":    { lat: 57.7200, lng: 11.9700, description: "Mossberget klätterområde" },
-  "Vattenfallet":  { lat: 57.7100, lng: 11.9650, description: "Vattenfallet" },
-  "Ängen":         { lat: 57.7050, lng: 11.9750, description: "Ängen" },
 };
 
 // Swedish weekday names mapped to JS day-of-week offsets from Monday (0-based)
@@ -48,11 +42,172 @@ const WEEKDAYS_SV = {
   "söndag":  6,
 };
 
+// Marker colors for each weekday (Google Static Maps named colors)
+const WEEKDAY_COLORS = {
+  "måndag":  "red",
+  "tisdag":  "blue",
+  "onsdag":  "green",
+  "torsdag": "purple",
+  "fredag":  "yellow",
+  "lördag":  "orange",
+  "söndag":  "gray",
+};
+
+// =============================================================================
+// API key — stored securely in Script Properties
+// =============================================================================
+
+/**
+ * Retrieves the Google Maps API key from Script Properties.
+ * Set it once via: setupApiKey("your-key-here") or manually in
+ * Project Settings > Script Properties > GOOGLE_MAPS_API_KEY
+ */
+function getApiKey_() {
+  const key = PropertiesService.getScriptProperties().getProperty("GOOGLE_MAPS_API_KEY");
+  if (!key) {
+    throw new Error(
+      "GOOGLE_MAPS_API_KEY not found in Script Properties. " +
+      "Run setupApiKey('your-key') or add it in Project Settings > Script Properties."
+    );
+  }
+  return key;
+}
+
+/**
+ * One-time helper to store your API key securely.
+ * Run from the editor: setupApiKey("AIza...")
+ * After running, delete the call from your code so the key isn't in source.
+ */
+function setupApiKey(key) {
+  PropertiesService.getScriptProperties().setProperty("GOOGLE_MAPS_API_KEY", key);
+  Logger.log("API key stored in Script Properties.");
+}
+
+// =============================================================================
+// Location loading from Google My Maps (KML)
+// =============================================================================
+
+/**
+ * Fetches all placemarks from the shared Google My Map and returns them
+ * as a name->location map: { "Steenen": { lat: 57.xx, lng: 11.xx, description: "..." }, ... }
+ *
+ * The KML export URL format is:
+ *   https://www.google.com/maps/d/kml?mid=MAP_ID&forcekml=1
+ */
+function fetchLocationsFromMyMap_() {
+  const url = "https://www.google.com/maps/d/kml?mid=" + CONFIG.MY_MAP_ID + "&forcekml=1";
+  Logger.log("Fetching KML from: " + url);
+
+  const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  if (response.getResponseCode() !== 200) {
+    throw new Error("Failed to fetch KML (HTTP " + response.getResponseCode() + "). " +
+                    "Make sure the map is shared publicly or with 'anyone with the link'.");
+  }
+
+  const kml = response.getContentText();
+  return parseKml_(kml);
+}
+
+/**
+ * Parses KML XML and extracts placemarks into a locations map.
+ * KML placemarks look like:
+ *   <Placemark>
+ *     <name>Steenen</name>
+ *     <description>Some description</description>
+ *     <Point><coordinates>11.9746,57.7089,0</coordinates></Point>
+ *   </Placemark>
+ */
+function parseKml_(kml) {
+  const doc = XmlService.parse(kml);
+  const root = doc.getRootElement();
+  const kmlNs = root.getNamespace();
+
+  const locations = {};
+  const placemarks = findElements_(root, "Placemark", kmlNs);
+
+  for (const pm of placemarks) {
+    const nameEl = pm.getChild("name", kmlNs);
+    const descEl = pm.getChild("description", kmlNs);
+    const pointEl = pm.getChild("Point", kmlNs);
+
+    if (!nameEl || !pointEl) continue;
+
+    const coordsEl = pointEl.getChild("coordinates", kmlNs);
+    if (!coordsEl) continue;
+
+    // KML coordinates are "lng,lat,altitude"
+    const parts = coordsEl.getText().trim().split(",");
+    if (parts.length < 2) continue;
+
+    const name = nameEl.getText().trim();
+    locations[name] = {
+      lat: parseFloat(parts[1]),
+      lng: parseFloat(parts[0]),
+      description: descEl ? descEl.getText().trim() : name,
+    };
+
+    Logger.log("  Loaded location: " + name + " (" + parts[1] + ", " + parts[0] + ")");
+  }
+
+  Logger.log("Loaded " + Object.keys(locations).length + " locations from My Map.");
+  return locations;
+}
+
+/**
+ * Recursively finds all elements with a given tag name in the KML document.
+ * Needed because KML can nest Placemarks inside Folders/Documents.
+ */
+function findElements_(element, tagName, namespace) {
+  let results = [];
+  const children = element.getChildren();
+  for (const child of children) {
+    if (child.getName() === tagName) {
+      results.push(child);
+    }
+    results = results.concat(findElements_(child, tagName, namespace));
+  }
+  return results;
+}
+
+// =============================================================================
+// Location matching
+// =============================================================================
+
+/**
+ * Finds a location by name in the locations map.
+ * Tries exact match, then case-insensitive, then partial/fuzzy.
+ */
+function findLocation_(name, locations) {
+  // Exact match
+  if (locations[name]) return { key: name, ...locations[name] };
+
+  // Case-insensitive match
+  for (const key in locations) {
+    if (key.toLowerCase() === name.toLowerCase()) {
+      return { key: key, ...locations[key] };
+    }
+  }
+
+  // Partial match (one contains the other)
+  for (const key in locations) {
+    if (key.toLowerCase().includes(name.toLowerCase()) ||
+        name.toLowerCase().includes(key.toLowerCase())) {
+      return { key: key, ...locations[key] };
+    }
+  }
+
+  Logger.log("WARNING: No coordinates found for location: " + name);
+  return null;
+}
+
 // =============================================================================
 // Main entry point - Run this on a time-based trigger (e.g. daily)
 // =============================================================================
 
 function processEmails() {
+  // Load locations from the shared Google My Map
+  const locations = fetchLocationsFromMyMap_();
+
   const label = getOrCreateLabel_(CONFIG.GMAIL_LABEL);
   const query = buildSearchQuery_();
 
@@ -68,7 +223,7 @@ function processEmails() {
       Logger.log("Processing email: " + message.getSubject() + " from " + message.getFrom());
 
       const body = message.getPlainBody();
-      const schedule = parseSchedule_(body);
+      const schedule = parseSchedule_(body, locations);
 
       if (schedule.length === 0) {
         Logger.log("No weekday-location pairs found in email body.");
@@ -104,12 +259,12 @@ function buildSearchQuery_() {
   return query;
 }
 
-function parseSchedule_(body) {
+function parseSchedule_(body, locations) {
   const schedule = [];
   const lines = body.split(/\r?\n/);
 
   for (const line of lines) {
-    // Match patterns like "Måndag: Steenen" or "Måndag - Steenen" or "Måndag  Steenen"
+    // Match patterns like "Måndag: Steenen" or "Måndag - Steenen" or "Måndag – Steenen"
     const match = line.match(
       /^\s*(måndag|tisdag|onsdag|torsdag|fredag|lördag|söndag)\s*[:;\-–—]\s*(.+)/i
     );
@@ -117,42 +272,19 @@ function parseSchedule_(body) {
       const weekday = match[1].toLowerCase();
       const locationName = match[2].trim();
       const dayOffset = WEEKDAYS_SV[weekday];
-      const locationData = findLocation_(locationName);
+      const locationData = findLocation_(locationName, locations);
 
       schedule.push({
         weekday: match[1],           // Original case
         weekdayLower: weekday,
         dayOffset: dayOffset,
         locationName: locationName,
-        location: locationData,      // null if not found in LOCATIONS map
+        location: locationData,      // null if not found
       });
     }
   }
 
   return schedule;
-}
-
-function findLocation_(name) {
-  // Exact match first
-  if (LOCATIONS[name]) return LOCATIONS[name];
-
-  // Case-insensitive match
-  for (const key in LOCATIONS) {
-    if (key.toLowerCase() === name.toLowerCase()) {
-      return LOCATIONS[key];
-    }
-  }
-
-  // Partial match (location name contains the search term or vice versa)
-  for (const key in LOCATIONS) {
-    if (key.toLowerCase().includes(name.toLowerCase()) ||
-        name.toLowerCase().includes(key.toLowerCase())) {
-      return LOCATIONS[key];
-    }
-  }
-
-  Logger.log("WARNING: No coordinates found for location: " + name);
-  return null;
 }
 
 // =============================================================================
@@ -162,53 +294,50 @@ function findLocation_(name) {
 /**
  * Generates map URLs for the schedule.
  * Returns an object with:
- *   - geojsonUrl: a geojson.io link showing labeled pins (names + weekdays)
- *   - googleMapsUrl: a Google Maps link showing all locations
+ *   - staticMapUrl: Google Maps Static API image URL with labeled pins
+ *   - googleMapsUrl: interactive Google Maps link with all locations
  */
 function generateMapUrls_(schedule) {
   const entries = schedule.filter(e => e.location);
-  if (entries.length === 0) return { geojsonUrl: "", googleMapsUrl: "" };
+  if (entries.length === 0) return { staticMapUrl: "", googleMapsUrl: "" };
 
   return {
-    geojsonUrl: buildGeojsonIoUrl_(entries),
+    staticMapUrl: buildStaticMapUrl_(entries),
     googleMapsUrl: buildGoogleMapsUrl_(entries),
   };
 }
 
 /**
- * Builds a geojson.io URL that shows an interactive map with labeled pins.
- * Each pin displays the weekday and location name as a popup and as marker text.
- * No API key required — opens directly in the browser.
+ * Builds a Google Maps Static API URL with colored, labeled markers.
+ * Each weekday gets a different color and a letter label (M, T, O, T, F).
+ * The label shows the first letter of the weekday.
+ *
+ * Requires a valid API key in Script Properties.
+ * Enable "Maps Static API" in your Google Cloud Console.
  */
-function buildGeojsonIoUrl_(entries) {
-  const features = entries.map(entry => ({
-    type: "Feature",
-    properties: {
-      "marker-color": "#e74c3c",
-      "marker-size": "medium",
-      "marker-symbol": "",
-      title: entry.weekday + ": " + entry.locationName,
-      description: entry.location.description || entry.locationName,
-    },
-    geometry: {
-      type: "Point",
-      coordinates: [entry.location.lng, entry.location.lat],  // GeoJSON is [lng, lat]
-    },
-  }));
+function buildStaticMapUrl_(entries) {
+  const apiKey = getApiKey_();
 
-  const geojson = {
-    type: "FeatureCollection",
-    features: features,
-  };
+  // Build one marker group per entry (each can have its own color + label)
+  const markerParams = entries.map(entry => {
+    const color = WEEKDAY_COLORS[entry.weekdayLower] || "red";
+    const label = entry.weekday.charAt(0).toUpperCase();
+    return "markers=color:" + color +
+           "%7Clabel:" + label +
+           "%7C" + entry.location.lat + "," + entry.location.lng;
+  });
 
-  // geojson.io accepts GeoJSON as a URL hash in the format:
-  // https://geojson.io/#data=data:application/json,<url-encoded-json>
-  const encoded = encodeURIComponent(JSON.stringify(geojson));
-  return "https://geojson.io/#data=data:application/json," + encoded;
+  const url = "https://maps.googleapis.com/maps/api/staticmap" +
+    "?size=" + CONFIG.STATIC_MAP_WIDTH + "x" + CONFIG.STATIC_MAP_HEIGHT +
+    "&maptype=roadmap" +
+    "&" + markerParams.join("&") +
+    "&key=" + apiKey;
+
+  return url;
 }
 
 /**
- * Builds a Google Maps URL as a fallback (no custom labels, but familiar UI).
+ * Builds an interactive Google Maps URL showing all locations.
  */
 function buildGoogleMapsUrl_(entries) {
   if (entries.length === 1) {
@@ -217,7 +346,6 @@ function buildGoogleMapsUrl_(entries) {
            e.location.lat + "," + e.location.lng;
   }
 
-  // Use the /dir/ format for multiple locations (shows all stops on one map)
   const origin = entries[0].location.lat + "," + entries[0].location.lng;
   const destination = entries[entries.length - 1].location.lat + "," + entries[entries.length - 1].location.lng;
   const waypoints = entries.slice(1, -1)
@@ -248,11 +376,11 @@ function buildMapDescription_(schedule, mapUrls) {
     desc += "\n";
   }
 
-  if (mapUrls.geojsonUrl) {
-    desc += "\nKarta med namn och veckodagar:\n" + mapUrls.geojsonUrl;
+  if (mapUrls.staticMapUrl) {
+    desc += "\nKarta (bild):\n" + mapUrls.staticMapUrl;
   }
   if (mapUrls.googleMapsUrl) {
-    desc += "\n\nGoogle Maps:\n" + mapUrls.googleMapsUrl;
+    desc += "\n\nInteraktiv karta:\n" + mapUrls.googleMapsUrl;
   }
 
   return desc;
@@ -350,7 +478,6 @@ function getOrCreateLabel_(labelName) {
 }
 
 function isAlreadyProcessed_(message, label) {
-  // We check at thread level via label, but this is a safety check
   const thread = message.getThread();
   const labels = thread.getLabels();
   return labels.some(l => l.getName() === label.getName());
@@ -373,7 +500,6 @@ function setupTrigger() {
     }
   }
 
-  // Create new daily trigger
   ScriptApp.newTrigger("processEmails")
     .timeBased()
     .everyDays(1)
@@ -384,9 +510,25 @@ function setupTrigger() {
 }
 
 /**
- * Test function - parse a sample email body without actually creating events.
+ * Test: fetch and list all locations from the shared Google My Map.
+ * Run this first to verify the KML import works.
+ */
+function testFetchLocations() {
+  const locations = fetchLocationsFromMyMap_();
+  Logger.log("=== Locations from My Map ===");
+  for (const name in locations) {
+    const loc = locations[name];
+    Logger.log("  " + name + ": " + loc.lat + ", " + loc.lng +
+               (loc.description ? " — " + loc.description : ""));
+  }
+}
+
+/**
+ * Test: parse a sample email and generate map URLs (without creating events).
  */
 function testParsing() {
+  const locations = fetchLocationsFromMyMap_();
+
   const sampleBody = `
 Hej alla!
 
@@ -401,29 +543,17 @@ Fredag: Ängen
 Ses där!
   `;
 
-  const schedule = parseSchedule_(sampleBody);
-  Logger.log("Parsed schedule:");
+  const schedule = parseSchedule_(sampleBody, locations);
+  Logger.log("=== Parsed schedule ===");
   for (const entry of schedule) {
     Logger.log("  " + entry.weekday + " -> " + entry.locationName +
                (entry.location ? " @ " + entry.location.lat + "," + entry.location.lng : " (no coords)"));
   }
 
   const mapUrls = generateMapUrls_(schedule);
-  Logger.log("GeoJSON map (with labels): " + mapUrls.geojsonUrl);
-  Logger.log("Google Maps (fallback):    " + mapUrls.googleMapsUrl);
+  Logger.log("\nStatic map image: " + mapUrls.staticMapUrl);
+  Logger.log("\nInteractive map:  " + mapUrls.googleMapsUrl);
 
   const description = buildMapDescription_(schedule, mapUrls);
-  Logger.log("Event description:\n" + description);
-}
-
-/**
- * List all known locations and their coordinates.
- */
-function listLocations() {
-  Logger.log("Known locations:");
-  for (const name in LOCATIONS) {
-    const loc = LOCATIONS[name];
-    Logger.log("  " + name + ": " + loc.lat + ", " + loc.lng +
-               (loc.description ? " (" + loc.description + ")" : ""));
-  }
+  Logger.log("\n=== Event description ===\n" + description);
 }
