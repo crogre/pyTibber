@@ -78,8 +78,8 @@ function processEmails() {
       Logger.log("Parsed schedule: " + JSON.stringify(schedule));
 
       const nextMonday = getNextMonday_();
-      const mapUrl = generateMapUrl_(schedule);
-      createCalendarEvents_(schedule, nextMonday, mapUrl);
+      const mapUrls = generateMapUrls_(schedule);
+      createCalendarEvents_(schedule, nextMonday, mapUrls);
     }
 
     // Mark entire thread as processed
@@ -159,68 +159,69 @@ function findLocation_(name) {
 // Map URL generation
 // =============================================================================
 
-function generateMapUrl_(schedule) {
-  // Use Google Maps with multiple markers
-  // Format: https://www.google.com/maps/dir/... or use markers
-  const markers = [];
-  const markerParams = [];
+/**
+ * Generates map URLs for the schedule.
+ * Returns an object with:
+ *   - geojsonUrl: a geojson.io link showing labeled pins (names + weekdays)
+ *   - googleMapsUrl: a Google Maps link showing all locations
+ */
+function generateMapUrls_(schedule) {
+  const entries = schedule.filter(e => e.location);
+  if (entries.length === 0) return { geojsonUrl: "", googleMapsUrl: "" };
 
-  for (const entry of schedule) {
-    if (!entry.location) continue;
-
-    // Each marker gets a label (first letter of weekday) and custom info
-    const label = entry.weekday.charAt(0).toUpperCase();
-    markers.push({
-      lat: entry.location.lat,
-      lng: entry.location.lng,
-      label: label,
-      title: entry.weekday + ": " + entry.locationName,
-    });
-
-    // Google Maps static-style marker param:
-    // markers=label:M|57.7089,11.9746
-    markerParams.push(
-      "markers=color:red%7Clabel:" + label + "%7C" +
-      entry.location.lat + "," + entry.location.lng
-    );
-  }
-
-  if (markers.length === 0) return "";
-
-  // Option 1: Google Maps Static API (requires API key)
-  // Uncomment and add your API key if you have one:
-  // const apiKey = "YOUR_GOOGLE_MAPS_API_KEY";
-  // const staticUrl = "https://maps.googleapis.com/maps/api/staticmap?size=800x600&" +
-  //                   markerParams.join("&") + "&key=" + apiKey;
-
-  // Option 2: Google My Maps link (dynamic, no API key needed)
-  // We'll create a shareable Google Maps URL with all waypoints
-  const url = buildGoogleMapsUrl_(markers);
-
-  return url;
+  return {
+    geojsonUrl: buildGeojsonIoUrl_(entries),
+    googleMapsUrl: buildGoogleMapsUrl_(entries),
+  };
 }
 
-function buildGoogleMapsUrl_(markers) {
-  if (markers.length === 0) return "";
+/**
+ * Builds a geojson.io URL that shows an interactive map with labeled pins.
+ * Each pin displays the weekday and location name as a popup and as marker text.
+ * No API key required — opens directly in the browser.
+ */
+function buildGeojsonIoUrl_(entries) {
+  const features = entries.map(entry => ({
+    type: "Feature",
+    properties: {
+      "marker-color": "#e74c3c",
+      "marker-size": "medium",
+      "marker-symbol": "",
+      title: entry.weekday + ": " + entry.locationName,
+      description: entry.location.description || entry.locationName,
+    },
+    geometry: {
+      type: "Point",
+      coordinates: [entry.location.lng, entry.location.lat],  // GeoJSON is [lng, lat]
+    },
+  }));
 
-  // Build a Google Maps URL that shows all locations
-  // Using the "search" format with multiple points shown via waypoints
-  // Format: https://www.google.com/maps?q=...  (single point)
-  // For multiple: use directions mode or embed markers
+  const geojson = {
+    type: "FeatureCollection",
+    features: features,
+  };
 
-  // Multi-marker approach: create a directions-style URL that visits all locations
-  // This shows all points on a single map
-  if (markers.length === 1) {
-    const m = markers[0];
+  // geojson.io accepts GeoJSON as a URL hash in the format:
+  // https://geojson.io/#data=data:application/json,<url-encoded-json>
+  const encoded = encodeURIComponent(JSON.stringify(geojson));
+  return "https://geojson.io/#data=data:application/json," + encoded;
+}
+
+/**
+ * Builds a Google Maps URL as a fallback (no custom labels, but familiar UI).
+ */
+function buildGoogleMapsUrl_(entries) {
+  if (entries.length === 1) {
+    const e = entries[0];
     return "https://www.google.com/maps/search/?api=1&query=" +
-           m.lat + "," + m.lng;
+           e.location.lat + "," + e.location.lng;
   }
 
-  // Use the /dir/ format for multiple locations (shows route with all stops)
-  const origin = markers[0].lat + "," + markers[0].lng;
-  const destination = markers[markers.length - 1].lat + "," + markers[markers.length - 1].lng;
-  const waypoints = markers.slice(1, -1)
-    .map(m => m.lat + "," + m.lng)
+  // Use the /dir/ format for multiple locations (shows all stops on one map)
+  const origin = entries[0].location.lat + "," + entries[0].location.lng;
+  const destination = entries[entries.length - 1].location.lat + "," + entries[entries.length - 1].location.lng;
+  const waypoints = entries.slice(1, -1)
+    .map(e => e.location.lat + "," + e.location.lng)
     .join("|");
 
   let url = "https://www.google.com/maps/dir/?api=1" +
@@ -234,7 +235,7 @@ function buildGoogleMapsUrl_(markers) {
   return url;
 }
 
-function buildMapDescription_(schedule, mapUrl) {
+function buildMapDescription_(schedule, mapUrls) {
   let desc = "Veckans platser:\n\n";
 
   for (const entry of schedule) {
@@ -247,8 +248,11 @@ function buildMapDescription_(schedule, mapUrl) {
     desc += "\n";
   }
 
-  if (mapUrl) {
-    desc += "\nKarta med alla platser:\n" + mapUrl;
+  if (mapUrls.geojsonUrl) {
+    desc += "\nKarta med namn och veckodagar:\n" + mapUrls.geojsonUrl;
+  }
+  if (mapUrls.googleMapsUrl) {
+    desc += "\n\nGoogle Maps:\n" + mapUrls.googleMapsUrl;
   }
 
   return desc;
@@ -258,9 +262,9 @@ function buildMapDescription_(schedule, mapUrl) {
 // Calendar event creation
 // =============================================================================
 
-function createCalendarEvents_(schedule, startMonday, mapUrl) {
+function createCalendarEvents_(schedule, startMonday, mapUrls) {
   const calendar = getCalendar_();
-  const fullDescription = buildMapDescription_(schedule, mapUrl);
+  const fullDescription = buildMapDescription_(schedule, mapUrls);
 
   for (const entry of schedule) {
     const eventDate = new Date(startMonday);
@@ -404,10 +408,11 @@ Ses där!
                (entry.location ? " @ " + entry.location.lat + "," + entry.location.lng : " (no coords)"));
   }
 
-  const mapUrl = generateMapUrl_(schedule);
-  Logger.log("Map URL: " + mapUrl);
+  const mapUrls = generateMapUrls_(schedule);
+  Logger.log("GeoJSON map (with labels): " + mapUrls.geojsonUrl);
+  Logger.log("Google Maps (fallback):    " + mapUrls.googleMapsUrl);
 
-  const description = buildMapDescription_(schedule, mapUrl);
+  const description = buildMapDescription_(schedule, mapUrls);
   Logger.log("Event description:\n" + description);
 }
 
